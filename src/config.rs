@@ -435,6 +435,7 @@ pub struct NotificationsModuleConfig {
     pub toast_limit: usize,
     pub toast_max_height: u32,
     pub blocklist: Vec<RegexCfg>,
+    pub show_progress_bar: bool,
 }
 impl Default for NotificationsModuleConfig {
     fn default() -> Self {
@@ -449,6 +450,7 @@ impl Default for NotificationsModuleConfig {
             toast_limit: 5,
             toast_max_height: 150,
             blocklist: vec![],
+            show_progress_bar: false,
         }
     }
 }
