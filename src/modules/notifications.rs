@@ -1,6 +1,8 @@
 use crate::{
     components::icons::{StaticIcon, icon, icon_button},
-    components::{ButtonHierarchy, ButtonKind, ButtonSize, MenuSize},
+    components::{
+        ButtonHierarchy, ButtonKind, ButtonSize, MenuSize, ProgressBarHierarchy, progress_bar,
+    },
     config::{NotificationsModuleConfig, ToastPosition},
     services::{
         ReadOnlyService, ServiceEvent,
@@ -15,17 +17,19 @@ use crate::{
 use chrono::{DateTime, Local};
 use iced::{
     Alignment, Border, Column, Element, Length, Padding, Row, Size, Subscription, Task, Theme,
+    time::every,
     widget::{Space, button, column, container, image, row, scrollable, sensor, svg, text},
 };
 use itertools::Itertools;
 use log::error;
 use std::{
-    collections::{HashSet, VecDeque},
-    time::Duration,
+    collections::{HashMap, HashSet, VecDeque},
+    time::{Duration, Instant},
 };
 use zbus::Connection;
 
 const ICON_SIZE: f32 = 36.0;
+const TOAST_PROGRESS_TICK: Duration = Duration::from_millis(16); // ~60fps
 
 fn notification_icon<'a, M: 'a>(icon_kind: Option<&NotificationIcon>) -> Element<'a, M> {
     match icon_kind {
@@ -112,6 +116,7 @@ pub enum Message {
     ExpireToast(u32),
     DismissToast(u32),
     ToastResized(Size),
+    ToastProgressTick,
 }
 
 #[derive(Debug, PartialEq)]
@@ -131,6 +136,11 @@ pub enum Action {
     UpdateToastInputRegion(Size),
 }
 
+struct ToastTimer {
+    started: Instant,
+    timeout: Duration,
+}
+
 pub struct Notifications {
     config: NotificationsModuleConfig,
     connection: Option<Connection>,
@@ -138,6 +148,7 @@ pub struct Notifications {
     expanded_groups: HashSet<String>,
     blocklist: Vec<crate::config::RegexCfg>,
     toasts: VecDeque<u32>,
+    toast_timers: HashMap<u32, ToastTimer>,
 }
 
 impl Notifications {
@@ -150,6 +161,7 @@ impl Notifications {
             expanded_groups: HashSet::new(),
             blocklist,
             toasts: VecDeque::new(),
+            toast_timers: HashMap::new(),
         }
     }
 
@@ -173,12 +185,14 @@ impl Notifications {
     fn clear_toasts(&mut self) -> bool {
         let had_toasts = !self.toasts.is_empty();
         self.toasts.clear();
+        self.toast_timers.clear();
         had_toasts
     }
 
     fn remove_toast(&mut self, id: u32) -> bool {
         let had_toasts = !self.toasts.is_empty();
         self.toasts.retain(|&toast_id| toast_id != id);
+        self.toast_timers.remove(&id);
         had_toasts
     }
 
@@ -186,6 +200,7 @@ impl Notifications {
         let had_toasts = !self.toasts.is_empty();
         let ids: HashSet<u32> = ids.iter().copied().collect();
         self.toasts.retain(|toast_id| !ids.contains(toast_id));
+        self.toast_timers.retain(|id, _| !ids.contains(id));
         had_toasts
     }
 
@@ -221,12 +236,14 @@ impl Notifications {
         match update_event {
             NotificationEvent::Received(notification) => {
                 if self.config.toast_limit == 0 {
-                    self.toasts.clear();
+                    self.clear_toasts();
                     return Action::None;
                 }
 
                 while self.toasts.len() >= self.config.toast_limit {
-                    self.toasts.pop_front();
+                    if let Some(evicted) = self.toasts.pop_front() {
+                        self.toast_timers.remove(&evicted);
+                    }
                 }
                 self.toasts.push_back(notification.id);
 
@@ -240,6 +257,15 @@ impl Notifications {
                 };
 
                 let timer_task = if let Some(timeout) = timeout {
+                    if self.config.show_progress_bar {
+                        self.toast_timers.insert(
+                            notification_id,
+                            ToastTimer {
+                                started: Instant::now(),
+                                timeout,
+                            },
+                        );
+                    }
                     Task::perform(
                         async move {
                             tokio::time::sleep(timeout).await;
@@ -281,7 +307,7 @@ impl Notifications {
                 self.blocklist = config.blocklist.clone();
                 self.config = config;
                 if hide {
-                    self.toasts.clear();
+                    self.clear_toasts();
                     Action::Hide(Task::none())
                 } else {
                     Action::None
@@ -369,6 +395,7 @@ impl Notifications {
                 self.hide_toasts_if_empty_with_task(had_toasts, task)
             }
             Message::ToastResized(size) => Action::UpdateToastInputRegion(size),
+            Message::ToastProgressTick => Action::None,
         }
     }
 
@@ -476,6 +503,19 @@ impl Notifications {
             None
         };
 
+        let progress_bar_element = (toast && self.config.show_progress_bar)
+            .then(|| self.toast_timers.get(&notification.id))
+            .flatten()
+            .map(|timer| {
+                let elapsed = timer.started.elapsed().as_secs_f32() / timer.timeout.as_secs_f32();
+                progress_bar(
+                    0.0..=1.0,
+                    1.0 - elapsed.clamp(0.0, 1.0),
+                    ProgressBarHierarchy::Primary,
+                )
+                .girth(space.xxs)
+            });
+
         let notification_id = notification.id;
 
         let app_icon_button = notification_icon(notification.icon.as_ref());
@@ -506,6 +546,7 @@ impl Notifications {
                 column!(
                     text(&notification.summary).wrapping(text::Wrapping::WordOrGlyph),
                     body_element,
+                    progress_bar_element,
                 )
                 .spacing(space.xxs)
                 .padding(Padding::new(space.xs).top(0.))
@@ -644,7 +685,16 @@ impl Notifications {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        NotificationsService::subscribe().map(Message::Event)
+        let events = NotificationsService::subscribe().map(Message::Event);
+
+        if self.toast_timers.is_empty() {
+            events
+        } else {
+            Subscription::batch(vec![
+                events,
+                every(TOAST_PROGRESS_TICK).map(|_| Message::ToastProgressTick),
+            ])
+        }
     }
 
     fn grouped_notifications<'a>(&'a self) -> Element<'a, Message> {
